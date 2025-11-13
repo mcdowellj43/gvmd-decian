@@ -6,7 +6,7 @@ WORKDIR /app
 RUN pip install flask
 
 # Copy the agent controller service
-COPY agent-controller-sqlite.py /app/agent-controller-sqlite.py
+COPY agent-controller-service.py /app/agent-controller-service.py
 
 # Make executable
 RUN chmod +x /app/agent-controller-service.py
