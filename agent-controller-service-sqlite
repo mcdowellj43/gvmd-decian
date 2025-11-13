@@ -40,6 +40,7 @@ logger = logging.getLogger(__name__)
 
 # Configuration
 API_KEY = os.environ.get("API_KEY", "test-api-key-12345")  # Change this in production
+AGENT_TOKEN = os.environ.get("AGENT_TOKEN", "test-agent-token-67890")  # Agent authentication token
 PORT = int(os.environ.get("PORT", 3001))
 HOST = os.environ.get("HOST", "0.0.0.0")
 
@@ -318,6 +319,50 @@ def require_api_key(f):
                 "UNAUTHORIZED",
                 "Invalid API key",
                 details=[{"field": "X-API-KEY", "issue": "API key is not valid"}],
+                status_code=401
+            )
+
+        return f(*args, **kwargs)
+    return decorated_function
+
+
+def require_agent_auth(f):
+    """
+    Decorator to require agent authentication.
+    Expects Authorization: Bearer <token> header. Per CLAUDE.md: NO FALLBACK BEHAVIOR.
+
+    Per PRD Section 9.1 (SR-AUTH-001): All Agent API endpoints require agent authentication.
+    """
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        auth_header = request.headers.get('Authorization')
+
+        if not auth_header:
+            logger.warning(f"Missing Authorization header from {request.remote_addr}")
+            return error_response(
+                "UNAUTHORIZED",
+                "Missing authentication token",
+                details=[{"field": "Authorization", "issue": "Required header is missing"}],
+                status_code=401
+            )
+
+        # Check for Bearer token format
+        if not auth_header.startswith('Bearer '):
+            return error_response(
+                "UNAUTHORIZED",
+                "Invalid authentication format",
+                details=[{"field": "Authorization", "issue": "Must use 'Bearer <token>' format"}],
+                status_code=401
+            )
+
+        token = auth_header[7:]  # Remove 'Bearer ' prefix
+
+        if token != AGENT_TOKEN:
+            logger.warning(f"Invalid agent token from {request.remote_addr}")
+            return error_response(
+                "UNAUTHORIZED",
+                "Invalid authentication token",
+                details=[{"field": "Authorization", "issue": "Token is not valid"}],
                 status_code=401
             )
 
@@ -673,6 +718,572 @@ def delete_scan(scan_id):
     except Exception as e:
         logger.error(f"Database error in delete_scan: {e}")
         return error_response("INTERNAL_ERROR", "Database error", status_code=500)
+
+
+# ============================================================================
+# Agent-Facing API - Endpoints for agents to interact with Agent Controller
+# Per PRD Section 6.1 (FR-AC-007 to FR-AC-009) and Section 8.3
+# ============================================================================
+
+@app.route('/api/v1/agents/heartbeat', methods=['POST'])
+@require_agent_auth
+def agent_heartbeat():
+    """
+    POST /api/v1/agents/heartbeat - Accept agent heartbeat
+
+    Maps to: FR-AC-007 (Agent API - Accept Heartbeats)
+
+    Request body per PRD Section 6.1:
+    {
+        "agent_id": "550e8400-...",
+        "hostname": "server1.example.com",
+        "connection_status": "active",
+        "ip_addresses": ["192.168.1.100", "10.0.0.50"],
+        "agent_version": "1.0.0",
+        "operating_system": "Ubuntu 22.04 LTS",
+        "architecture": "amd64"
+    }
+
+    Response: HTTP 200 OK
+    {
+        "status": "accepted",
+        "config_updated": false,
+        "next_heartbeat_in_seconds": 600,
+        "authorized": true
+    }
+    """
+    data = request.get_json()
+    if not data:
+        return error_response("INVALID_REQUEST", "Missing request body", status_code=400)
+
+    # Validate required fields per FR-AC-007
+    required_fields = ["agent_id", "hostname"]
+    missing_fields = [field for field in required_fields if field not in data]
+    if missing_fields:
+        return error_response(
+            "INVALID_REQUEST",
+            "Missing required fields",
+            details=[{"field": field, "issue": "Required field is missing"} for field in missing_fields],
+            status_code=400
+        )
+
+    agent_id = data["agent_id"]
+
+    # Validate UUID format per SR-VALID-001
+    try:
+        uuid.UUID(agent_id)
+    except ValueError:
+        return error_response(
+            "VALIDATION_ERROR",
+            "Invalid agent_id format",
+            details=[{"field": "agent_id", "issue": f"Must be a valid UUID (got: {agent_id})"}],
+            status_code=422
+        )
+
+    timestamp = int(datetime.utcnow().timestamp())
+
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+
+        # Check if agent exists
+        cur.execute("SELECT agent_id, authorized, config FROM agents WHERE agent_id = ?", (agent_id,))
+        existing_agent = cur.fetchone()
+
+        config_updated = False
+
+        if existing_agent:
+            # Update existing agent per FR-AC-007
+            logger.info(f"Heartbeat from existing agent {agent_id}")
+
+            # Delete old IP addresses
+            cur.execute("DELETE FROM agent_ip_addresses WHERE agent_id = ?", (agent_id,))
+
+            # Update agent record
+            cur.execute("""
+                UPDATE agents SET
+                    hostname = ?,
+                    connection_status = ?,
+                    last_update = ?,
+                    last_updater_heartbeat = ?,
+                    agent_version = ?,
+                    operating_system = ?,
+                    architecture = ?
+                WHERE agent_id = ?
+            """, (
+                data.get("hostname"),
+                data.get("connection_status", "active"),
+                timestamp,
+                timestamp,
+                data.get("agent_version", ""),
+                data.get("operating_system", ""),
+                data.get("architecture", ""),
+                agent_id
+            ))
+
+            authorized = bool(existing_agent["authorized"])
+
+        else:
+            # Auto-register new agent on first heartbeat per FR-AC-007
+            logger.info(f"Auto-registering new agent {agent_id} on first heartbeat")
+
+            cur.execute("""
+                INSERT INTO agents (
+                    agent_id, hostname, authorized, connection_status, last_update,
+                    last_updater_heartbeat, config, updater_version, agent_version,
+                    operating_system, architecture, update_to_latest
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                agent_id,
+                data.get("hostname"),
+                0,  # Not authorized by default - admin must authorize
+                data.get("connection_status", "active"),
+                timestamp,
+                timestamp,
+                json.dumps(get_default_scan_agent_config()),
+                data.get("updater_version", ""),
+                data.get("agent_version", ""),
+                data.get("operating_system", ""),
+                data.get("architecture", ""),
+                0
+            ))
+
+            authorized = False
+
+        # Insert new IP addresses
+        for ip_address in data.get("ip_addresses", []):
+            cur.execute(
+                "INSERT INTO agent_ip_addresses (agent_id, ip_address) VALUES (?, ?)",
+                (agent_id, ip_address)
+            )
+
+        conn.commit()
+        cur.close()
+        conn.close()
+
+        # Get heartbeat interval from config
+        global global_config
+        if global_config is None:
+            global_config = get_default_scan_agent_config()
+
+        next_heartbeat_in_seconds = global_config.get("heartbeat", {}).get("interval_in_seconds", 600)
+
+        logger.info(f"POST /api/v1/agents/heartbeat - accepted heartbeat from {agent_id}, authorized={authorized}")
+
+        return jsonify({
+            "status": "accepted",
+            "config_updated": config_updated,
+            "next_heartbeat_in_seconds": next_heartbeat_in_seconds,
+            "authorized": authorized
+        }), 200
+
+    except Exception as e:
+        logger.error(f"Database error in agent_heartbeat: {e}")
+        return error_response("INTERNAL_ERROR", "Database error", status_code=500)
+
+
+@app.route('/api/v1/agents/jobs', methods=['GET'])
+@require_agent_auth
+def agent_get_jobs():
+    """
+    GET /api/v1/agents/jobs - Poll for scan jobs
+
+    Maps to: FR-AC-008 (Agent API - Serve Jobs to Agents)
+
+    Request headers:
+    - Authorization: Bearer <agent-token>
+    - X-Agent-ID: <agent-uuid>
+
+    Response: HTTP 200 OK
+    {
+        "jobs": [
+            {
+                "job_id": "job-12345",
+                "scan_id": "550e8400-...",
+                "job_type": "vulnerability_scan",
+                "priority": "normal",
+                "created_at": "2025-01-15T10:25:00Z",
+                "config": {
+                    "vts": [...],
+                    "targets": [...],
+                    "scanner_preferences": {...}
+                }
+            }
+        ]
+    }
+    """
+    agent_id = request.headers.get('X-Agent-ID')
+
+    if not agent_id:
+        return error_response(
+            "INVALID_REQUEST",
+            "Missing agent ID",
+            details=[{"field": "X-Agent-ID", "issue": "Required header is missing"}],
+            status_code=400
+        )
+
+    # Validate UUID format per SR-VALID-001
+    try:
+        uuid.UUID(agent_id)
+    except ValueError:
+        return error_response(
+            "VALIDATION_ERROR",
+            "Invalid agent_id format",
+            details=[{"field": "X-Agent-ID", "issue": f"Must be a valid UUID (got: {agent_id})"}],
+            status_code=422
+        )
+
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+
+        # Check if agent exists and is authorized per FR-AC-008
+        cur.execute("SELECT authorized FROM agents WHERE agent_id = ?", (agent_id,))
+        agent_row = cur.fetchone()
+
+        if not agent_row:
+            cur.close()
+            conn.close()
+            return error_response(
+                "NOT_FOUND",
+                f"Agent not found: {agent_id}",
+                details=[{"field": "X-Agent-ID", "issue": "Agent must send heartbeat to register first"}],
+                status_code=404
+            )
+
+        if not agent_row["authorized"]:
+            # Return empty jobs array if not authorized
+            logger.info(f"GET /api/v1/agents/jobs - agent {agent_id} not authorized, returning empty jobs")
+            cur.close()
+            conn.close()
+            return jsonify({"jobs": []}), 200
+
+        # Get queued jobs for this agent per FR-AC-008
+        cur.execute("""
+            SELECT job_id, scan_id, job_type, priority, created_at, status, config
+            FROM scan_jobs
+            WHERE agent_id = ? AND status = 'queued'
+            ORDER BY created_at ASC
+        """, (agent_id,))
+
+        rows = cur.fetchall()
+        jobs = []
+        for row in rows:
+            job = {
+                "job_id": row["job_id"],
+                "scan_id": row["scan_id"],
+                "job_type": row["job_type"],
+                "priority": row["priority"],
+                "created_at": row["created_at"],
+                "config": json.loads(row["config"])
+            }
+            jobs.append(job)
+
+            # Mark job as assigned per FR-AC-008
+            cur.execute("""
+                UPDATE scan_jobs SET status = 'assigned' WHERE job_id = ?
+            """, (row["job_id"],))
+
+        conn.commit()
+        cur.close()
+        conn.close()
+
+        logger.info(f"GET /api/v1/agents/jobs - returning {len(jobs)} jobs for agent {agent_id}")
+
+        return jsonify({"jobs": jobs}), 200
+
+    except Exception as e:
+        logger.error(f"Database error in agent_get_jobs: {e}")
+        return error_response("INTERNAL_ERROR", "Database error", status_code=500)
+
+
+@app.route('/api/v1/agents/jobs/<job_id>/results', methods=['POST'])
+@require_agent_auth
+def agent_submit_results(job_id):
+    """
+    POST /api/v1/agents/jobs/{job_id}/results - Submit scan results
+
+    Maps to: FR-AC-009 (Agent API - Accept Results)
+
+    Request body per PRD Section 6.1:
+    {
+        "job_id": "job-12345",
+        "scan_id": "550e8400-...",
+        "agent_id": "550e8400-...",
+        "status": "completed",
+        "started_at": "2025-01-15T10:30:00Z",
+        "completed_at": "2025-01-15T10:45:00Z",
+        "results": [
+            {
+                "nvt": {
+                    "oid": "1.3.6.1.4.1.25623.1.0.12345",
+                    "name": "OpenSSH Obsolete Version Detection",
+                    "severity": 5.0,
+                    "cvss_base_vector": "AV:N/AC:L/Au:N/C:N/I:N/A:N"
+                },
+                "host": "localhost",
+                "port": "22/tcp",
+                "threat": "Medium",
+                "description": "The remote SSH server is running an obsolete version.",
+                "qod": 80
+            }
+        ]
+    }
+
+    Response: HTTP 202 Accepted
+    {
+        "status": "accepted",
+        "results_received": 1
+    }
+    """
+    data = request.get_json()
+    if not data:
+        return error_response("INVALID_REQUEST", "Missing request body", status_code=400)
+
+    # Validate required fields per FR-AC-009
+    required_fields = ["job_id", "scan_id", "agent_id", "status", "results"]
+    missing_fields = [field for field in required_fields if field not in data]
+    if missing_fields:
+        return error_response(
+            "INVALID_REQUEST",
+            "Missing required fields",
+            details=[{"field": field, "issue": "Required field is missing"} for field in missing_fields],
+            status_code=400
+        )
+
+    if data["job_id"] != job_id:
+        return error_response(
+            "INVALID_REQUEST",
+            "Job ID mismatch",
+            details=[{"field": "job_id", "issue": f"URL job_id ({job_id}) does not match body job_id ({data['job_id']})"}],
+            status_code=400
+        )
+
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+
+        # Verify job exists per FR-AC-009
+        cur.execute("SELECT scan_id, agent_id FROM scan_jobs WHERE job_id = ?", (job_id,))
+        job_row = cur.fetchone()
+
+        if not job_row:
+            cur.close()
+            conn.close()
+            return error_response("NOT_FOUND", f"Job not found: {job_id}", status_code=404)
+
+        scan_id = job_row["scan_id"]
+        expected_agent_id = job_row["agent_id"]
+
+        if data["agent_id"] != expected_agent_id:
+            cur.close()
+            conn.close()
+            return error_response(
+                "FORBIDDEN",
+                "Agent not authorized for this job",
+                details=[{"field": "agent_id", "issue": f"Job belongs to different agent"}],
+                status_code=403
+            )
+
+        # Get agent hostname for results
+        cur.execute("SELECT hostname FROM agents WHERE agent_id = ?", (data["agent_id"],))
+        agent_row = cur.fetchone()
+        agent_hostname = agent_row["hostname"] if agent_row else "unknown"
+
+        # Store results in database per FR-AC-009
+        results_count = 0
+        for result in data.get("results", []):
+            result_id = f"result-{uuid.uuid4()}"
+            nvt = result.get("nvt", {})
+
+            cur.execute("""
+                INSERT INTO scan_results (
+                    result_id, scan_id, agent_id, agent_hostname,
+                    nvt_oid, nvt_name, nvt_severity, nvt_cvss_base_vector,
+                    host, port, threat, description, qod
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                result_id,
+                scan_id,
+                data["agent_id"],
+                agent_hostname,
+                nvt.get("oid"),
+                nvt.get("name"),
+                nvt.get("severity"),
+                nvt.get("cvss_base_vector"),
+                result.get("host"),
+                result.get("port"),
+                result.get("threat"),
+                result.get("description"),
+                result.get("qod")
+            ))
+            results_count += 1
+
+        # Update job status
+        cur.execute("""
+            UPDATE scan_jobs SET status = ? WHERE job_id = ?
+        """, (data["status"], job_id))
+
+        # Update scan progress per FR-AC-009
+        if data["status"] == "completed":
+            # Increment agents_completed counter
+            cur.execute("""
+                UPDATE scans SET
+                    agents_completed = agents_completed + 1,
+                    agents_running = CASE WHEN agents_running > 0 THEN agents_running - 1 ELSE 0 END
+                WHERE scan_id = ?
+            """, (scan_id,))
+
+            # Update scan status if all agents completed
+            cur.execute("""
+                SELECT agents_total, agents_completed
+                FROM scans
+                WHERE scan_id = ?
+            """, (scan_id,))
+            scan_row = cur.fetchone()
+
+            if scan_row and scan_row["agents_completed"] >= scan_row["agents_total"]:
+                # All agents completed, mark scan as completed
+                end_time = int(datetime.utcnow().timestamp())
+                cur.execute("""
+                    UPDATE scans SET status = 'completed', end_time = ?, progress = 100
+                    WHERE scan_id = ?
+                """, (end_time, scan_id))
+            else:
+                # Calculate progress percentage
+                if scan_row:
+                    progress = int((scan_row["agents_completed"] / scan_row["agents_total"]) * 100)
+                    cur.execute("""
+                        UPDATE scans SET progress = ? WHERE scan_id = ?
+                    """, (progress, scan_id))
+
+        elif data["status"] == "running":
+            # Increment agents_running counter
+            cur.execute("""
+                UPDATE scans SET
+                    agents_running = agents_running + 1,
+                    status = 'running'
+                WHERE scan_id = ?
+            """, (scan_id,))
+
+        conn.commit()
+        cur.close()
+        conn.close()
+
+        logger.info(f"POST /api/v1/agents/jobs/{job_id}/results - accepted {results_count} results from agent {data['agent_id']}")
+
+        return jsonify({
+            "status": "accepted",
+            "results_received": results_count
+        }), 202
+
+    except Exception as e:
+        logger.error(f"Database error in agent_submit_results: {e}")
+        return error_response("INTERNAL_ERROR", "Database error", status_code=500)
+
+
+@app.route('/api/v1/agents/jobs/<job_id>/complete', methods=['POST'])
+@require_agent_auth
+def agent_complete_job(job_id):
+    """
+    POST /api/v1/agents/jobs/{job_id}/complete - Mark job as complete
+
+    Secondary endpoint for explicit job completion signal
+
+    Response: HTTP 200 OK
+    {
+        "status": "completed"
+    }
+    """
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+
+        # Verify job exists
+        cur.execute("SELECT scan_id, status FROM scan_jobs WHERE job_id = ?", (job_id,))
+        job_row = cur.fetchone()
+
+        if not job_row:
+            cur.close()
+            conn.close()
+            return error_response("NOT_FOUND", f"Job not found: {job_id}", status_code=404)
+
+        # Update job status to completed
+        cur.execute("""
+            UPDATE scan_jobs SET status = 'completed' WHERE job_id = ?
+        """, (job_id,))
+
+        scan_id = job_row["scan_id"]
+
+        # Update scan counters
+        cur.execute("""
+            UPDATE scans SET
+                agents_completed = agents_completed + 1,
+                agents_running = CASE WHEN agents_running > 0 THEN agents_running - 1 ELSE 0 END
+            WHERE scan_id = ?
+        """, (scan_id,))
+
+        # Check if all agents completed
+        cur.execute("""
+            SELECT agents_total, agents_completed
+            FROM scans
+            WHERE scan_id = ?
+        """, (scan_id,))
+        scan_row = cur.fetchone()
+
+        if scan_row and scan_row["agents_completed"] >= scan_row["agents_total"]:
+            end_time = int(datetime.utcnow().timestamp())
+            cur.execute("""
+                UPDATE scans SET status = 'completed', end_time = ?, progress = 100
+                WHERE scan_id = ?
+            """, (end_time, scan_id))
+
+        conn.commit()
+        cur.close()
+        conn.close()
+
+        logger.info(f"POST /api/v1/agents/jobs/{job_id}/complete - marked job as completed")
+
+        return jsonify({"status": "completed"}), 200
+
+    except Exception as e:
+        logger.error(f"Database error in agent_complete_job: {e}")
+        return error_response("INTERNAL_ERROR", "Database error", status_code=500)
+
+
+@app.route('/api/v1/agents/config', methods=['GET'])
+@require_agent_auth
+def agent_get_config():
+    """
+    GET /api/v1/agents/config - Get agent configuration
+
+    Secondary endpoint for agents to fetch their configuration
+
+    Response: HTTP 200 OK
+    {
+        "heartbeat": {
+            "interval_in_seconds": 600,
+            "miss_until_inactive": 1
+        },
+        "retry": {
+            "attempts": 5,
+            "delay_in_seconds": 60,
+            "max_jitter_in_seconds": 30
+        },
+        "agent_script_executor": {
+            "bulk_size": 100,
+            "bulk_throttle_time_in_ms": 1000,
+            "scheduler_cron_time": ["0 2 * * *"]
+        }
+    }
+    """
+    global global_config
+
+    if global_config is None:
+        global_config = get_default_scan_agent_config()
+
+    logger.info("GET /api/v1/agents/config - returning agent configuration")
+    return jsonify(global_config), 200
 
 
 # ============================================================================
@@ -1049,6 +1660,7 @@ if __name__ == '__main__':
     logger.info("=" * 60)
     logger.info(f"Starting server on {HOST}:{PORT}")
     logger.info(f"API Key: {API_KEY}")
+    logger.info(f"Agent Token: {AGENT_TOKEN}")
     logger.info(f"Database: {DB_PATH}")
     logger.info("")
     logger.info("Scanner API (for gvmd):")
@@ -1056,6 +1668,13 @@ if __name__ == '__main__':
     logger.info("  GET    /scans/{id}/status    - Get scan status (FR-AC-002)")
     logger.info("  GET    /scans/{id}/results   - Get scan results (FR-AC-003)")
     logger.info("  DELETE /scans/{id}           - Delete scan")
+    logger.info("")
+    logger.info("Agent-Facing API (requires Bearer token):")
+    logger.info("  POST   /api/v1/agents/heartbeat              - Accept heartbeat (FR-AC-007)")
+    logger.info("  GET    /api/v1/agents/jobs                   - Poll for jobs (FR-AC-008)")
+    logger.info("  POST   /api/v1/agents/jobs/{id}/results      - Submit results (FR-AC-009)")
+    logger.info("  POST   /api/v1/agents/jobs/{id}/complete     - Mark job complete")
+    logger.info("  GET    /api/v1/agents/config                 - Get agent config")
     logger.info("")
     logger.info("Admin API (requires X-API-KEY header):")
     logger.info("  GET    /api/v1/admin/agents          - List all agents (FR-AC-004)")
