@@ -8,7 +8,7 @@
  * @brief Agent management implementation for GVMD.
  *
  * This file contains the logic for synchronizing, modifying, and deleting agents
- * between GVMD and the Agent Controller. It provides utility functions to convert
+ * between GVMD and the Agent Controller. It provides some utility functions to convert
  * between GVMD agent structures and agent controller representations, as well as
  * helpers for filtering, iteration, and connector setup.
  */
@@ -524,16 +524,33 @@ sync_agents_from_agent_controller (gvmd_agent_connector_t connector)
   if (!connector)
     return AGENT_RESPONSE_CONNECTOR_CREATION_FAILED;
 
+  g_message ("[AGENT_DEBUG] sync_agents_from_agent_controller: Getting agents from agent controller");
   agent_controller_agent_list_t agent_controller_agents =
     agent_controller_get_agents (connector->base);
 
   if (!agent_controller_agents)
-    return AGENT_RESPONSE_SYNC_FAILED;
+    {
+      g_message ("[AGENT_DEBUG] sync_agents_from_agent_controller: agent_controller_get_agents returned NULL");
+      return AGENT_RESPONSE_SYNC_FAILED;
+    }
+
+  g_message ("[AGENT_DEBUG] sync_agents_from_agent_controller: Retrieved %d agents from agent controller", agent_controller_agents->count);
 
   if (agent_controller_agents->count == 0)
     {
       agent_controller_agent_list_free (agent_controller_agents);
       return AGENT_RESPONSE_SUCCESS;
+    }
+
+  // Debug log each agent received from agent controller
+  for (int i = 0; i < agent_controller_agents->count; i++)
+    {
+      agent_controller_agent_t agent = agent_controller_agents->agents[i];
+      g_message ("[AGENT_DEBUG] Agent %d from controller: agent_id='%s', hostname='%s', authorized=%d, connection_status='%s'",
+                 i, agent->agent_id ? agent->agent_id : "NULL",
+                 agent->hostname ? agent->hostname : "NULL",
+                 agent->authorized,
+                 agent->connection_status ? agent->connection_status : "NULL");
     }
 
   agent_data_list_t agent_data_list =
@@ -549,14 +566,18 @@ sync_agents_from_agent_controller (gvmd_agent_connector_t connector)
       return convert_result;
     }
 
+  g_message ("[AGENT_DEBUG] sync_agents_from_agent_controller: Calling sync_agents_from_data_list with %d agents", agent_data_list->count);
   int result = sync_agents_from_data_list (agent_data_list);
 
   if (result < 0)
     {
+      g_message ("[AGENT_DEBUG] sync_agents_from_agent_controller: sync_agents_from_data_list failed with result %d", result);
       agent_data_list_free (agent_data_list);
       agent_controller_agent_list_free (agent_controller_agents);
       return AGENT_RESPONSE_SYNC_FAILED;
     }
+
+  g_message ("[AGENT_DEBUG] sync_agents_from_agent_controller: sync_agents_from_data_list succeeded");
 
   agent_data_list_free (agent_data_list);
   agent_controller_agent_list_free (agent_controller_agents);

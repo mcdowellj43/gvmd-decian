@@ -5,7 +5,7 @@
 
 /**
  * @file
- * @brief SQL backend implementation for agent management in GVMD.
+ * @brief SQL backend implementation for agent management in GVMD. Test
  *
  * This file provides the implementation of SQL interactions related to
  * agent data, including creation, update, deletion, and synchronization
@@ -278,6 +278,8 @@ get_scanner_from_agent_uuid (const gchar *agent_uuid, scanner_t *scanner)
 int
 sync_agents_from_data_list (agent_data_list_t agent_list)
 {
+  g_message ("[AGENT_DEBUG] sync_agents_from_data_list: Processing %d agents", agent_list ? agent_list->count : 0);
+
   if (!agent_list || agent_list->count == 0)
     return 0;
 
@@ -318,15 +320,23 @@ sync_agents_from_data_list (agent_data_list_t agent_list)
     {
       agent_data_t agent = agent_list->agents[i];
 
+      g_message ("[AGENT_DEBUG] sync_agents_from_data_list: Processing agent %d: agent_id='%s', hostname='%s', authorized=%d, connection_status='%s'",
+                 i, agent->agent_id ? agent->agent_id : "NULL",
+                 agent->hostname ? agent->hostname : "NULL",
+                 agent->authorized,
+                 agent->connection_status ? agent->connection_status : "NULL");
+
       gboolean exists = agent_column_exists ("agent_id", agent->agent_id);
 
       if (exists)
         {
+          g_message ("[AGENT_DEBUG] sync_agents_from_data_list: Agent %s exists, updating", agent->agent_id);
           update_existing_agent (agent);
           delete_existing_agent_ips (agent->agent_id);
         }
       else
         {
+          g_message ("[AGENT_DEBUG] sync_agents_from_data_list: Agent %s is new, adding to buffer", agent->agent_id);
           append_agent_row_to_buffer (&agent_buffer, agent);
         }
 
@@ -357,6 +367,7 @@ sync_agents_from_data_list (agent_data_list_t agent_list)
   db_copy_buffer_cleanup (&agent_buffer);
   db_copy_buffer_cleanup (&ip_buffer);
 
+  g_message ("[AGENT_DEBUG] sync_agents_from_data_list: Completed with status %d", status);
   return status;
 }
 

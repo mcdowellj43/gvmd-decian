@@ -1,0 +1,22 @@
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Install required Python packages
+RUN pip install flask
+
+# Copy the agent controller service
+COPY agent-controller-sqlite.py /app/agent-controller-sqlite.py
+
+# Make executable
+RUN chmod +x /app/agent-controller-service.py
+
+# Expose the agent controller port
+EXPOSE 3001
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD curl -f http://localhost:3001/health || exit 1
+
+# Run the agent controller service
+CMD ["python3", "/app/agent-controller-service.py"]
